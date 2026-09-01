@@ -370,8 +370,32 @@ def register_handlers(client):
     @client.on(events.NewMessage(pattern=prefix("checknow"), **own))
     async def _checknow(event):
         await event.edit("▸ checking…")
+        # Full self-contained diagnosis, reported in Telegram (not just stdout).
+        chat = state.get("monitor_chat")
+        post_id = state.get("post_id")
+        editable = await can_edit_here(client, chat) if chat is not None else None
+        edit_txt = {True: "yes", False: "NO — not an admin/can't edit", None: "?"}[editable]
+
+        active = None
+        detail = "-"
+        if chat is not None and post_id is not None:
+            msg = await client.get_messages(chat, ids=post_id)
+            if msg and msg.message:
+                found = URL_RE.findall(msg.message)
+                if found:
+                    active = found[0].strip()
+                    _, detail = await check_link(client, active)
+
         keep_going, note = await rotate(client)
-        await event.edit("▸ %s" % note)
+        await event.edit(
+            "▸ watching chat: %s · post #%s\n"
+            "▸ active link: %s\n"
+            "▸ link check: %s\n"
+            "▸ can edit post here: %s\n"
+            "▸ result: %s"
+            % (chat, post_id, active or "none (run .monitor in the channel first)",
+               detail, edit_txt, note)
+        )
 
     @client.on(events.NewMessage(pattern=prefix("status"), **own))
     async def _status(event):
