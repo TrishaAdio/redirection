@@ -1,15 +1,17 @@
-# Telethon Link-Monitor Userbot
+# Telethon Invite-Link Monitor Userbot
 
-A personal (userbot) Telegram account automation built on
-[Telethon](https://docs.telethon.dev). You keep a pool of links in your own
-**Saved Messages** (one link per line). In any chat you run `.monitor`, and
-every 15 minutes the bot "clicks" the active link. When a link expires it is
-marked used and the next link from your Saved Messages is promoted
-automatically.
+A personal (userbot) Telegram automation built on
+[Telethon](https://docs.telethon.dev). You keep a stack of spare **invite
+links** in your own **Saved Messages** (one per line). Your channel has a post
+that shows the current invite link (usually repeated over several lines). You
+run `.monitor` in that channel; every 15 minutes the bot checks whether the
+link is still valid, and the moment it's revoked/expired it **edits the channel
+post in place** — swapping in the next fresh link from your Saved Messages and
+keeping the same multi-line style. No status messages are posted to the channel.
 
 > ⚠️ This logs in as **your own account** (a userbot), not a Bot API bot.
 > Automating a user account can violate Telegram's Terms of Service — use a
-> throwaway/secondary account and reasonable intervals at your own risk.
+> secondary account and reasonable intervals at your own risk.
 
 ## Quick start
 
@@ -28,43 +30,55 @@ Get your `api_id` / `api_hash` at <https://my.telegram.org> → *API development
 Then run the bot:
 
 ```bash
-./.venv/bin/python userbot.py          # Linux / macOS
-.venv\Scripts\python userbot.py        # Windows
+python3 userbot.py
 ```
+
+You can use plain `python3 userbot.py` from the project folder — the script
+**automatically re-executes itself inside `.venv`**, so it always uses the same
+Telethon that created your session. (Running with a mismatched system Telethon
+is what caused the earlier `too many values to unpack` crash.)
 
 ## How to use
 
-1. Open **Saved Messages** and send your links, one per line, e.g.:
+1. Open **Saved Messages** and send your spare invite links, one per line:
    ```
-   https://example.com/ref/aaa
-   https://example.com/ref/bbb
-   https://example.com/ref/ccc
-   https://example.com/ref/ddd
+   https://t.me/+AAAAaaaa1111
+   https://t.me/+BBBBbbbb2222
+   https://t.me/+CCCCcccc3333
+   https://t.me/+DDDDdddd4444
    ```
-   Multiple messages are fine — every link found is added to the pool.
-2. In any chat/channel, send `.monitor` **from your own account**.
-3. The bot clicks the active link now and every 15 minutes after. Status
-   updates are posted in the chat where you ran `.monitor`.
+   Multiple messages are fine — every link found becomes part of the pool.
+2. In your channel, make sure there's a post that contains the current invite
+   link (repeated on as many lines as you like — that style is preserved).
+3. In that channel, send `.monitor` **from your own account**.
+4. The bot checks the link now and every 15 minutes. When it expires it edits
+   the post to the next valid link from your Saved Messages and marks that one
+   used. Nothing else is posted to the channel.
 
 ## Commands
 
 Send these yourself, from the account running the userbot:
 
-| Command         | What it does                                            |
-|-----------------|---------------------------------------------------------|
-| `.monitor`      | start the 15-min click loop in the current chat         |
-| `.stopmonitor`  | stop the loop                                           |
-| `.links`        | show the pool with `active` / `used` / `queued` tags    |
-| `.clicknow`     | click the active link immediately                       |
-| `.ping`         | health check                                            |
+| Command         | What it does                                                    |
+|-----------------|-----------------------------------------------------------------|
+| `.monitor`      | watch the invite-link post in the current channel               |
+| `.stopmonitor`  | stop watching                                                   |
+| `.status`       | show active link + validity + pool counts                       |
+| `.links`        | list the Saved-Messages pool (`active` / `used` / `queued`)     |
+| `.checknow`     | force an immediate validity check + rotate if needed            |
+| `.ping`         | health check                                                    |
 
-## What "clicking" and "expired" mean
+## How validity is checked
 
-- **Click** = an HTTP `GET` of the link (following redirects) with a
-  browser-like user agent, so it counts as a real visit.
-- A link is treated as **expired** when the request fails, returns HTTP
-  `>= 400`, or the page body contains any expiry keyword
-  (`expired`, `not found`, `invalid`, `no longer`, `404` by default).
+- **Telegram invite links** (`t.me/+…`, `t.me/joinchat/…`, `tg://join?invite=…`)
+  are validated through Telegram's `CheckChatInvite` API — **not** an HTTP
+  request. This is why the earlier version wrongly flagged valid links as
+  `404`: an invite link is not a normal web page.
+- A link is rotated **only** when Telegram reports it expired/invalid/revoked.
+  Transient problems (flood-wait, network hiccups) are treated as "still alive"
+  so the bot never rotates by mistake.
+- Plain `http(s)` links (if you ever use them) fall back to an HTTP `GET` with
+  the configurable `expiry_keywords` check.
 
 ## Configuration (`config.json`)
 
@@ -72,21 +86,21 @@ Created by `setup.py`; edit any time:
 
 | Key                | Meaning                                             |
 |--------------------|-----------------------------------------------------|
-| `interval_minutes` | click interval (default `15`)                       |
+| `interval_minutes` | check interval (default `15`)                       |
 | `command_prefix`   | command trigger prefix (default `.`)                |
-| `link_source`      | where links are read from (`me` = Saved Messages)   |
-| `expiry_keywords`  | words in a page body that mean "expired"            |
-| `user_agent`       | UA sent when clicking                               |
+| `link_source`      | where spare links are read from (`me` = Saved Messages) |
+| `expiry_keywords`  | words that mean "expired" for plain http links      |
+| `user_agent`       | UA used for http-link fallback                      |
 
-Runtime state (used links, active link, monitor chat) is kept in
-`state.json` so monitoring resumes after a restart.
+Runtime state (used links, active link, watched channel + post id) is kept in
+`state.json`, so monitoring resumes automatically after a restart.
 
 ## Files
 
 ```
 setup.py          bootstrap: venv + deps + login
 login.py          interactive credential prompt + Telegram sign-in
-userbot.py        the userbot: commands + monitor loop
+userbot.py        the userbot: commands + monitor/rotate loop
 config.py         config/state load & save helpers
 requirements.txt  telethon, aiohttp
 ```

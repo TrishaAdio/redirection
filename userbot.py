@@ -1,47 +1,94 @@
-"""Telethon userbot: link monitor.
+"""Telethon userbot: Telegram invite-link monitor.
 
 Workflow
 --------
-1. From your own account, send 4-5 links (one per line) to Saved Messages.
-   Multiple messages are fine; every link found is added to the pool.
-2. In any channel/chat, send ``.monitor`` (from your own account).
-3. Every ``interval_minutes`` (default 15) the bot "clicks" (HTTP GET) the
-   currently active link.
-4. When the active link is detected as expired, it is marked used, the next
-   unused link from Saved Messages becomes active, and a note is posted in
-   the channel where ``.monitor`` was started.
+1. From your own account, send your spare invite links (one per line) to your
+   Saved Messages. Each line is one fresh link, e.g.:
+       https://t.me/+AAAA
+       https://t.me/+BBBB
+       https://t.me/+CCCC
+2. In your channel there is a post that shows the *current* invite link,
+   usually repeated on several lines (the "4-5 line" style).
+3. In that channel, send ``.monitor`` (from your own account). The bot finds
+   the most recent post that contains invite links and starts watching it.
+4. Every ``interval_minutes`` (default 15) it validates the link via Telegram
+   (``CheckChatInvite`` — NOT an HTTP request). When the link is revoked or
+   expired, it takes the next unused link from your Saved Messages, EDITS the
+   channel post in place (keeping the same multi-line style), and marks the
+   consumed link used. No status spam is posted to the channel.
 
 Commands (send them yourself, from the account running the userbot):
-    .monitor        start the 15-minute click loop in the current chat
-    .stopmonitor    stop the loop
-    .links          show the current pool + which links are used/active
-    .clicknow       trigger an immediate click of the active link
+    .monitor        watch the invite-link post in the current channel
+    .stopmonitor    stop watching
+    .status         show active link + validity + pool counts
+    .links          list the Saved-Messages pool (queued / used)
+    .checknow       force an immediate validity check + rotate if needed
     .ping           health check
 """
 
+# --- make sure we run inside the project venv --------------------------------
+import os
+import sys
+
+
+def _reexec_in_venv():
+    """If a project venv exists and we're not using it, re-exec with it.
+
+    This prevents the classic 'ValueError: too many values to unpack' /
+    version-mismatch crash from running `python3 userbot.py` with a different
+    system Telethon than the one that created the session.
+    """
+    root = os.path.dirname(os.path.abspath(__file__))
+    if os.name == "nt":
+        venv_py = os.path.join(root, ".venv", "Scripts", "python.exe")
+    else:
+        venv_py = os.path.join(root, ".venv", "bin", "python")
+    if not os.path.exists(venv_py):
+        return
+    try:
+        if os.path.samefile(sys.executable, venv_py):
+            return
+    except OSError:
+        pass
+    os.execv(venv_py, [venv_py, os.path.abspath(__file__), *sys.argv[1:]])
+
+
+_reexec_in_venv()
+
 import asyncio
 import re
-import sys
 
 import aiohttp
 from telethon import TelegramClient, events
+from telethon.tl.functions.messages import CheckChatInviteRequest
+from telethon.errors import (
+    FloodWaitError,
+    InviteHashEmptyError,
+    InviteHashExpiredError,
+    InviteHashInvalidError,
+)
 
 import config
 
 cfg = config.load_config()
 state = config.load_state()
 
-# --- link extraction ---------------------------------------------------------
+# Any URL (used to locate the pool links and the channel post links).
 URL_RE = re.compile(r"(https?://\S+|t\.me/\S+|tg://\S+)", re.IGNORECASE)
+# Extract the invite hash from t.me/+HASH, joinchat/HASH, tg://join?invite=HASH.
+INVITE_RE = re.compile(r"(?:joinchat/|\+|invite=)([A-Za-z0-9_\-]{5,})")
 
-# Monitor task handle so it can be started/stopped.
 _monitor_task = None
 _http_session = None
 
 
 def prefix(cmd):
-    """Build a regex pattern for a command with the configured prefix."""
     return r"^\%s%s$" % (cfg["command_prefix"], cmd)
+
+
+def invite_hash(link):
+    m = INVITE_RE.search(link)
+    return m.group(1) if m else None
 
 
 async def get_http():
@@ -54,36 +101,33 @@ async def get_http():
     return _http_session
 
 
-async def fetch_pool(client):
-    """Read every link from the link source (Saved Messages), oldest first."""
-    found = []
-    async for msg in client.iter_messages(cfg["link_source"], limit=300):
-        if not msg.message:
-            continue
-        for match in URL_RE.findall(msg.message):
-            found.append(match.strip())
-    found.reverse()  # iter_messages is newest-first; we want oldest-first
-    # de-duplicate while preserving order
-    seen, ordered = set(), []
-    for link in found:
-        if link not in seen:
-            seen.add(link)
-            ordered.append(link)
-    return ordered
+# --- validity check ----------------------------------------------------------
+async def check_link(client, link):
+    """Return (alive: bool, detail: str).
+
+    Telegram invite links are validated through the API. Only a genuine
+    expired/invalid/revoked result rotates the link; transient errors
+    (flood-wait, network) are treated as 'alive' so we never rotate by mistake.
+    Plain http(s) links fall back to an HTTP GET + keyword check.
+    """
+    h = invite_hash(link)
+    if h:
+        try:
+            await client(CheckChatInviteRequest(h))
+            return True, "valid"
+        except (InviteHashExpiredError, InviteHashInvalidError, InviteHashEmptyError) as exc:
+            return False, type(exc).__name__
+        except FloodWaitError as exc:
+            return True, "floodwait:%ss" % exc.seconds
+        except Exception as exc:  # noqa: BLE001 - don't rotate on unknown errors
+            return True, "skip:%s" % type(exc).__name__
+
+    if link.lower().startswith("http"):
+        return await http_click(link)
+    return True, "unknown-scheme"
 
 
-def pick_next(pool):
-    """First link in the pool that isn't used and isn't already active."""
-    used = set(state.get("used", []))
-    active = state.get("active")
-    for link in pool:
-        if link not in used and link != active:
-            return link
-    return None
-
-
-async def click(url):
-    """'Click' a link. Returns (alive: bool, detail: str)."""
+async def http_click(url):
     session = await get_http()
     try:
         async with session.get(url, allow_redirects=True) as resp:
@@ -98,80 +142,136 @@ async def click(url):
                     return False, "matched '%s'" % kw
             return True, "HTTP %s" % resp.status
     except asyncio.TimeoutError:
-        return False, "timeout"
-    except Exception as exc:  # noqa: BLE001 - any network error == treat as dead
-        return False, type(exc).__name__
+        return True, "timeout"          # transient -> don't rotate
+    except Exception as exc:            # noqa: BLE001
+        return True, "skip:%s" % type(exc).__name__
 
 
-async def report(client, text):
-    chat = state.get("monitor_chat")
-    if chat is not None:
-        try:
-            await client.send_message(chat, text, link_preview=False)
-        except Exception:  # noqa: BLE001
-            pass
+# --- pool from Saved Messages ------------------------------------------------
+async def fetch_pool(client):
+    """Every link in the link source (Saved Messages), oldest first, de-duped."""
+    found = []
+    async for msg in client.iter_messages(cfg["link_source"], limit=300):
+        if not msg.message:
+            continue
+        for match in URL_RE.findall(msg.message):
+            found.append(match.strip())
+    found.reverse()
+    seen, ordered = set(), []
+    for link in found:
+        if link not in seen:
+            seen.add(link)
+            ordered.append(link)
+    return ordered
 
 
-async def ensure_active(client):
-    """Make sure state has an active link; return it (or None)."""
-    pool = await fetch_pool(client)
-    active = state.get("active")
+def pick_next(pool):
     used = set(state.get("used", []))
-    if not active or active in used or active not in pool:
-        active = pick_next(pool)
-        state["active"] = active
+    active = state.get("active")
+    for link in pool:
+        if link not in used and link != active:
+            return link
+    return None
+
+
+async def next_valid_link(client, pool):
+    """Find the next unused link that Telegram confirms is still valid.
+
+    Every candidate we take out of the pool is marked used (consumed),
+    including dead ones we skip past.
+    """
+    while True:
+        cand = pick_next(pool)
+        if not cand:
+            return None
+        used = state.setdefault("used", [])
+        if cand not in used:
+            used.append(cand)
         config.save_state(state)
-    return active, pool
+        alive, _ = await check_link(client, cand)
+        if alive:
+            return cand
+        # dead spare: it's already marked used, loop to the next one
 
 
-async def do_cycle(client):
-    """One monitor cycle: click active, rotate on expiry. Returns keep_going."""
-    active, pool = await ensure_active(client)
-    if not active:
-        await report(client, "▸ monitor: no unused links left in the pool.")
-        return False
+# --- the channel post we manage ----------------------------------------------
+async def find_link_post(client, chat, exclude_id):
+    """Newest message in `chat` (excluding the command) that has invite links."""
+    async for msg in client.iter_messages(chat, limit=60):
+        if msg.id == exclude_id or not msg.message:
+            continue
+        if URL_RE.search(msg.message):
+            return msg
+    return None
 
-    alive, detail = await click(active)
-    if alive:
-        await report(client, "▸ clicked active link — ok (%s)\n%s" % (detail, active))
-        return True
 
-    # expired -> mark used, rotate to next
-    used = state.get("used", [])
-    if active not in used:
-        used.append(active)
-    state["used"] = used
-    new_link = pick_next(pool)
-    state["active"] = new_link
+async def rotate(client):
+    """Check the managed post's link; if dead, edit it to a fresh one.
+
+    Returns (keep_going: bool, note: str).
+    """
+    chat = state.get("monitor_chat")
+    post_id = state.get("post_id")
+    if chat is None or post_id is None:
+        return False, "no post"
+
+    msg = await client.get_messages(chat, ids=post_id)
+    if not msg:
+        return False, "post deleted"
+
+    text = msg.message or ""
+    links = URL_RE.findall(text)
+    if not links:
+        return True, "post has no links"
+
+    active = links[0].strip()
+    state["active"] = active
     config.save_state(state)
 
-    if new_link:
-        alive2, detail2 = await click(new_link)
-        status = "ok" if alive2 else "also dead (%s)" % detail2
-        await report(
-            client,
-            "▸ link expired (%s), marked used:\n%s\n\n▸ switched to next link — %s:\n%s"
-            % (detail, active, status, new_link),
-        )
-        return True
+    alive, detail = await check_link(client, active)
+    if alive:
+        return True, "active valid (%s)" % detail
 
-    await report(
-        client,
-        "▸ link expired (%s), marked used:\n%s\n\n▸ no more unused links in the pool."
-        % (detail, active),
-    )
-    return False
+    # expired -> mark used, find a fresh valid one, edit the post in place
+    used = state.setdefault("used", [])
+    if active not in used:
+        used.append(active)
+    config.save_state(state)
+
+    pool = await fetch_pool(client)
+    new_link = await next_valid_link(client, pool)
+    if not new_link:
+        return False, "expired (%s) — no valid spare links left" % detail
+
+    # keep the exact style: replace every occurrence of the dead link.
+    new_text = text.replace(active, new_link)
+    if new_text == text:  # links differed; swap all links to be safe
+        new_text = URL_RE.sub(lambda m: new_link, text)
+    await client.edit_message(chat, post_id, new_text, link_preview=False)
+    state["active"] = new_link
+    config.save_state(state)
+    print("[rotate] %s expired -> swapped to %s" % (active, new_link))
+    return True, "swapped -> %s" % new_link
 
 
 async def monitor_loop(client):
     interval = max(1, int(cfg["interval_minutes"])) * 60
     while True:
-        keep_going = await do_cycle(client)
+        try:
+            keep_going, note = await rotate(client)
+            print("[monitor] %s" % note)
+        except Exception as exc:  # noqa: BLE001 - never let the loop die silently
+            print("[monitor] error: %r" % exc)
+            keep_going = True
         if not keep_going:
             break
         await asyncio.sleep(interval)
-    state["monitor_chat"] = state.get("monitor_chat")
-    config.save_state(state)
+
+
+def _pool_counts(pool):
+    used = set(state.get("used", []))
+    queued = [l for l in pool if l not in used]
+    return len(queued), len(used)
 
 
 def register_handlers(client):
@@ -180,14 +280,22 @@ def register_handlers(client):
     @client.on(events.NewMessage(pattern=prefix("monitor"), **own))
     async def _monitor(event):
         global _monitor_task
-        state["monitor_chat"] = event.chat_id
-        config.save_state(state)
-        if _monitor_task and not _monitor_task.done():
-            await event.edit("▸ monitor already running in this or another chat.")
+        post = await find_link_post(client, event.chat_id, event.id)
+        if not post:
+            await event.edit("▸ no invite-link post found in this channel.")
             return
+        state["monitor_chat"] = event.chat_id
+        state["post_id"] = post.id
+        config.save_state(state)
+
+        if _monitor_task and not _monitor_task.done():
+            _monitor_task.cancel()
+        keep_going, note = await rotate(client)
+        pool = await fetch_pool(client)
+        q, u = _pool_counts(pool)
         await event.edit(
-            "▸ monitor started. clicking every %s min in this chat."
-            % cfg["interval_minutes"]
+            "▸ monitoring post #%d · every %s min · pool: %d queued / %d used · %s"
+            % (post.id, cfg["interval_minutes"], q, u, note)
         )
         _monitor_task = asyncio.create_task(monitor_loop(client))
 
@@ -201,10 +309,25 @@ def register_handlers(client):
         else:
             await event.edit("▸ monitor is not running.")
 
-    @client.on(events.NewMessage(pattern=prefix("clicknow"), **own))
-    async def _clicknow(event):
-        await event.edit("▸ clicking now…")
-        await do_cycle(client)
+    @client.on(events.NewMessage(pattern=prefix("checknow"), **own))
+    async def _checknow(event):
+        await event.edit("▸ checking…")
+        keep_going, note = await rotate(client)
+        await event.edit("▸ %s" % note)
+
+    @client.on(events.NewMessage(pattern=prefix("status"), **own))
+    async def _status(event):
+        active = state.get("active")
+        pool = await fetch_pool(client)
+        q, u = _pool_counts(pool)
+        running = _monitor_task and not _monitor_task.done()
+        detail = "-"
+        if active:
+            _, detail = await check_link(client, active)
+        await event.edit(
+            "▸ monitor: %s\n▸ active: %s (%s)\n▸ pool: %d queued / %d used"
+            % ("on" if running else "off", active or "none", detail, q, u)
+        )
 
     @client.on(events.NewMessage(pattern=prefix("links"), **own))
     async def _links(event):
@@ -212,16 +335,11 @@ def register_handlers(client):
         used = set(state.get("used", []))
         active = state.get("active")
         if not pool:
-            await event.edit("▸ pool is empty. send links to Saved Messages, one per line.")
+            await event.edit("▸ pool empty. send invite links to Saved Messages, one per line.")
             return
-        lines = ["▸ link pool (%d):" % len(pool)]
+        lines = ["▸ pool (%d):" % len(pool)]
         for i, link in enumerate(pool, 1):
-            if link == active:
-                tag = "active"
-            elif link in used:
-                tag = "used"
-            else:
-                tag = "queued"
+            tag = "active" if link == active else ("used" if link in used else "queued")
             lines.append("%d. [%s] %s" % (i, tag, link))
         await event.edit("\n".join(lines))
 
@@ -240,13 +358,12 @@ async def main():
     me = await client.get_me()
     register_handlers(client)
     print("Userbot running as %s (id %s)." % (me.first_name, me.id))
-    print("Send '%smonitor' in a chat to begin." % cfg["command_prefix"])
+    print("Send '%smonitor' in your channel to begin." % cfg["command_prefix"])
 
-    # Resume monitoring if it was running before a restart.
-    if state.get("monitor_chat"):
+    if state.get("monitor_chat") and state.get("post_id"):
         global _monitor_task
         _monitor_task = asyncio.create_task(monitor_loop(client))
-        print("Resumed monitor in chat %s." % state["monitor_chat"])
+        print("Resumed monitor on post #%s." % state["post_id"])
 
     try:
         await client.run_until_disconnected()
