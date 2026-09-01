@@ -66,7 +66,15 @@ Send these yourself, from the account running the userbot:
 | `.status`       | show active link + validity + pool counts                       |
 | `.links`        | list the Saved-Messages pool (`active` / `used` / `queued`)     |
 | `.checknow`     | force an immediate validity check + rotate if needed            |
+| `.reset`        | clear used/active state so every spare link is queued again     |
 | `.ping`         | health check                                                    |
+
+## Requirement: the account must be an admin of the channel
+
+To edit the channel post, the account running the userbot must be an **admin of
+the channel with the right to edit/post messages** (or the channel creator). If
+it isn't, `.monitor` will refuse to start and tell you so, and no spare links
+are consumed. Add the account as an admin, then run `.monitor` again.
 
 ## How validity is checked
 

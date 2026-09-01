@@ -23,6 +23,7 @@ Commands (send them yourself, from the account running the userbot):
     .status         show active link + validity + pool counts
     .links          list the Saved-Messages pool (queued / used)
     .checknow       force an immediate validity check + rotate if needed
+    .reset          clear used/active state (re-queue every spare link)
     .ping           health check
 """
 
@@ -149,19 +150,25 @@ async def http_click(url):
 
 # --- pool from Saved Messages ------------------------------------------------
 async def fetch_pool(client):
-    """Every link in the link source (Saved Messages), oldest first, de-duped."""
-    found = []
+    """Every link in the link source (Saved Messages), de-duped.
+
+    Order: oldest message first, and within a single message the links are
+    kept in reading order (top line first). iter_messages is newest-first, so
+    we collect message texts, reverse the message order, then read each
+    message's links top-to-bottom.
+    """
+    texts = []
     async for msg in client.iter_messages(cfg["link_source"], limit=300):
-        if not msg.message:
-            continue
-        for match in URL_RE.findall(msg.message):
-            found.append(match.strip())
-    found.reverse()
+        if msg.message:
+            texts.append(msg.message)
+    texts.reverse()  # oldest message first
     seen, ordered = set(), []
-    for link in found:
-        if link not in seen:
-            seen.add(link)
-            ordered.append(link)
+    for text in texts:
+        for match in URL_RE.findall(text):
+            link = match.strip()
+            if link not in seen:
+                seen.add(link)
+                ordered.append(link)
     return ordered
 
 
@@ -175,23 +182,24 @@ def pick_next(pool):
 
 
 async def next_valid_link(client, pool):
-    """Find the next unused link that Telegram confirms is still valid.
+    """Return the next unused link Telegram confirms is still valid.
 
-    Every candidate we take out of the pool is marked used (consumed),
-    including dead ones we skip past.
+    Genuinely-dead spares are marked used as we skip past them, but the valid
+    link we return is NOT marked used here — the caller marks it only after it
+    has actually been placed into the post, so a failed edit wastes nothing.
     """
     while True:
         cand = pick_next(pool)
         if not cand:
             return None
+        alive, _ = await check_link(client, cand)
+        if alive:
+            return cand
+        # genuinely dead spare: mark used so we don't retry it
         used = state.setdefault("used", [])
         if cand not in used:
             used.append(cand)
         config.save_state(state)
-        alive, _ = await check_link(client, cand)
-        if alive:
-            return cand
-        # dead spare: it's already marked used, loop to the next one
 
 
 # --- the channel post we manage ----------------------------------------------
@@ -203,6 +211,19 @@ async def find_link_post(client, chat, exclude_id):
         if URL_RE.search(msg.message):
             return msg
     return None
+
+
+async def can_edit_here(client, chat):
+    """True/False if we can/can't edit posts in `chat`; None if undetermined."""
+    try:
+        perms = await client.get_permissions(chat, "me")
+        return bool(
+            getattr(perms, "is_creator", False)
+            or getattr(perms, "edit_messages", False)
+            or getattr(perms, "post_messages", False)
+        )
+    except Exception:  # noqa: BLE001 - private chats etc. are always editable
+        return None
 
 
 async def rotate(client):
@@ -232,12 +253,7 @@ async def rotate(client):
     if alive:
         return True, "active valid (%s)" % detail
 
-    # expired -> mark used, find a fresh valid one, edit the post in place
-    used = state.setdefault("used", [])
-    if active not in used:
-        used.append(active)
-    config.save_state(state)
-
+    # expired -> find a fresh valid spare, then edit the post in place.
     pool = await fetch_pool(client)
     new_link = await next_valid_link(client, pool)
     if not new_link:
@@ -247,7 +263,21 @@ async def rotate(client):
     new_text = text.replace(active, new_link)
     if new_text == text:  # links differed; swap all links to be safe
         new_text = URL_RE.sub(lambda m: new_link, text)
-    await client.edit_message(chat, post_id, new_text, link_preview=False)
+    try:
+        await client.edit_message(chat, post_id, new_text, link_preview=False)
+    except Exception as exc:  # noqa: BLE001
+        # Most likely the account lacks edit rights on this channel post.
+        # Do NOT consume the valid spare, so nothing is wasted.
+        print("[rotate] edit failed: %r" % exc)
+        return False, ("cannot edit the post (%s) — this account must be an "
+                       "admin of the channel with the right to edit/post "
+                       "messages." % type(exc).__name__)
+
+    # success: only now mark the dead link and the newly-placed link as used.
+    used = state.setdefault("used", [])
+    for link in (active, new_link):
+        if link not in used:
+            used.append(link)
     state["active"] = new_link
     config.save_state(state)
     print("[rotate] %s expired -> swapped to %s" % (active, new_link))
@@ -307,6 +337,17 @@ def register_handlers(client):
 
         if _monitor_task and not _monitor_task.done():
             _monitor_task.cancel()
+
+        editable = await can_edit_here(client, event.chat_id)
+        if editable is False:
+            await event.edit(
+                "▸ found post #%d, but this account can't edit posts here.\n"
+                "▸ make this account an admin of the channel with the "
+                "'Edit messages of others' / post right, then run .monitor again."
+                % post.id
+            )
+            return
+
         keep_going, note = await rotate(client)
         pool = await fetch_pool(client)
         q, u = _pool_counts(pool)
@@ -359,6 +400,14 @@ def register_handlers(client):
             tag = "active" if link == active else ("used" if link in used else "queued")
             lines.append("%d. [%s] %s" % (i, tag, link))
         await event.edit("\n".join(lines))
+
+    @client.on(events.NewMessage(pattern=prefix("reset"), **own))
+    async def _reset(event):
+        state["used"] = []
+        state["active"] = None
+        config.save_state(state)
+        pool = await fetch_pool(client)
+        await event.edit("▸ pool reset — %d links now queued." % len(pool))
 
     @client.on(events.NewMessage(pattern=prefix("ping"), **own))
     async def _ping(event):
