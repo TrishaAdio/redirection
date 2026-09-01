@@ -274,12 +274,29 @@ def _pool_counts(pool):
     return len(queued), len(used)
 
 
+def _cmd_from_owner(event):
+    """Which messages count as a command from you.
+
+    - Your own outgoing messages (Saved Messages, DMs, groups): ``event.out``.
+    - Anonymous broadcast-channel posts: in a broadcast channel your posts are
+      attributed to the channel, so ``out`` is False and the sender is the
+      channel — but only admins can post there, so any command-shaped post in a
+      broadcast channel is treated as yours.
+    """
+    if event.out:
+        return True
+    if event.is_channel and not event.is_group:
+        return True
+    return False
+
+
 def register_handlers(client):
-    own = dict(outgoing=True, from_users="me")
+    own = dict(func=_cmd_from_owner)
 
     @client.on(events.NewMessage(pattern=prefix("monitor"), **own))
     async def _monitor(event):
         global _monitor_task
+        print("[cmd] .monitor in chat %s" % event.chat_id)
         post = await find_link_post(client, event.chat_id, event.id)
         if not post:
             await event.edit("▸ no invite-link post found in this channel.")
@@ -345,6 +362,8 @@ def register_handlers(client):
 
     @client.on(events.NewMessage(pattern=prefix("ping"), **own))
     async def _ping(event):
+        print("[cmd] .ping in chat %s (out=%s, channel=%s)"
+              % (event.chat_id, event.out, event.is_channel))
         await event.edit("▸ pong — userbot alive.")
 
 
